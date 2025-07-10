@@ -1,28 +1,31 @@
 from typing import Any, Dict, List
 import pandas as pd
-from pathlib import Path
 from datetime import datetime
 from io import BytesIO
 import base64
 from astrbot.api.star import Star, register, Context
 from astrbot.api.event.filter import PermissionType
+from astrbot.core.platform.message_type import MessageType
 from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
+
+
 @register(
     "astrbot_plugin_group_information",
     "Futureppo",
     "导出群成员信息为Excel表格",
-    "1.0.7",
+    "1.0.8",
     "https://github.com/Futureppo/astrbot_plugin_group_information",
 )
 class GroupInformationPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
 
-    def _format_timestamp(self, timestamp):
+    @staticmethod
+    def _format_timestamp(timestamp):
         """格式化时间戳为可读时间，出错则用对应位的零代替"""
         if isinstance(timestamp, (int, float)) and timestamp >= 0:
             return datetime.fromtimestamp(float(timestamp)).strftime(
@@ -31,7 +34,8 @@ class GroupInformationPlugin(Star):
         else:
             return "0000-00-00 00:00:00"
 
-    def _clean_excel_invalid_chars(self, text):
+    @staticmethod
+    def _clean_excel_invalid_chars(text):
         """清理Excel不支持的特殊字符"""
         if not isinstance(text, str):
             return text
@@ -40,14 +44,35 @@ class GroupInformationPlugin(Star):
         )
 
     @filter.command("导出群数据")
-    async def export_group_data(self, event: AiocqhttpMessageEvent):
+    async def export_group_data(self, event: AiocqhttpMessageEvent, group_id: str = ''):
         """导出指定群聊成员信息到Excel文件"""
-        yield event.plain_result("正在导出本群数据...")
+        if group_id:
+            group_id = group_id.strip()
+            if not group_id.isdigit():
+                yield event.plain_result("请输入有效的群号")
+                return
+        else:
+            group_id = event.get_group_id()
+            if not group_id:
+                yield event.plain_result("请在群聊中使用此命令或提供有效的群号")
+                return
         try:
             client = event.bot
-            group_id = event.get_group_id()
+
+            try:
+                is_group_member = await client.get_group_member_info(
+                    group_id=int(group_id), user_id=int(event.get_sender_id()), no_cache=True
+                )  # type: ignore
+            except Exception as e:
+                logger.error(f"获取群成员信息时出错: {e}")
+                is_group_member = False
+            if not is_group_member:
+                yield event.plain_result("你不在该群聊中，无法导出数据")
+                return
             # 获取群成员列表
-            members: list[dict] = await client.get_group_member_list(group_id=int(group_id))  # type: ignore
+            members: list[dict] = await client.get_group_member_list(
+                group_id=int(group_id), no_cache=True
+            )  # type: ignore
             # 处理成员数据
             processed_members = self._process_members(members)
             # 生成Excel文件
@@ -57,11 +82,18 @@ class GroupInformationPlugin(Star):
             # 设置文件名
             file_name = f"群聊{group_id}的{len(processed_members)}名成员的数据.xlsx"
             # 上传文件
-            await self._upload_file(event, file_content, group_id, file_name)
+            message_type = 'group' if event.message_obj.type == MessageType.GROUP_MESSAGE else 'private'
+            if message_type == 'group':
+                group_or_user_id = event.get_group_id()
+            else:
+                group_or_user_id = event.get_sender_id()
+            await self._upload_file(
+                event, file_content, group_or_user_id, file_name, message_type=message_type
+            )
 
         except Exception as e:
             logger.error(f"导出群数据时出错: {e}")
-            yield event.plain_result("导出群数据时出错")
+            yield event.plain_result(f"导出群数据时出错")
 
     @filter.permission_type(PermissionType.ADMIN)
     @filter.command("导出所有群数据")
@@ -69,7 +101,7 @@ class GroupInformationPlugin(Star):
         """导出所有群的成员信息到多个sheet的Excel文件中"""
 
         client = event.bot
-        group_list = await client.get_group_list()
+        group_list = await client.get_group_list(no_cache=True)
         yield event.plain_result(f"正在导出{len(group_list)}个群的数据...")
         try:
             # 创建Excel工作簿到内存中
@@ -82,7 +114,9 @@ class GroupInformationPlugin(Star):
                     group_name = group["group_name"]
 
                     try:
-                        members: list[dict] = await client.get_group_member_list(group_id=group_id)  # type: ignore
+                        members: list[dict] = await client.get_group_member_list(
+                            group_id=group_id, no_cache=True
+                        )  # type: ignore
                         processed_members = self._process_members(members)
                         for member in processed_members:
                             member["group_name"] = self._clean_excel_invalid_chars(
@@ -107,8 +141,13 @@ class GroupInformationPlugin(Star):
                 f"{len(group_list)}个群的{total_members}名成员的数据.xlsx"
             )
             # 上传文件
+            message_type = 'group' if event.message_obj.type == MessageType.GROUP_MESSAGE else 'private'
+            if message_type == 'group':
+                group_or_user_id = event.get_group_id()
+            else:
+                group_or_user_id = event.get_sender_id()
             await self._upload_file(
-                event, file_content=file_content, group_id=event.get_group_id(), file_name=file_name
+                event, file_content, group_or_user_id, file_name, message_type=message_type
             )
 
         except Exception as e:
@@ -150,8 +189,9 @@ class GroupInformationPlugin(Star):
 
         return processed_members
 
+    @staticmethod
     def _generate_excel_file(
-        self, data: List[Dict[str, Any]], sheet_name: str = "Sheet1"
+        data: List[Dict[str, Any]], sheet_name: str = "Sheet1"
     ) -> bytes:
         """生成Excel文件"""
         df = pd.DataFrame(data)
@@ -162,22 +202,30 @@ class GroupInformationPlugin(Star):
         output_buffer.seek(0)
         return output_buffer.getvalue()
 
+    @staticmethod
     async def _upload_file(
-        self,
         event: AiocqhttpMessageEvent,
         file_content: bytes,
-        group_id: str | int,
+        user_or_group_id: str | int,
         file_name: str,
+        message_type: str,
     ) -> bool:
-        """上传文件"""
+        """上传文件到群组"""
         client = event.bot
         try:
             file_content_base64 = base64.b64encode(file_content).decode("utf-8")
-            await client.upload_group_file(
-                group_id=int(group_id),
-                file=f"base64://{file_content_base64}",
-                name=file_name,
-            )
+            if message_type == 'group':
+                await client.upload_group_file(
+                    group_id=int(user_or_group_id),
+                    file=f"base64://{file_content_base64}",
+                    name=file_name,
+                )
+            else:
+                await client.upload_private_file(
+                    user_id=int(user_or_group_id),
+                    file=f"base64://{file_content_base64}",
+                    name=file_name,
+                )
             logger.info(f"文件上传完成：{file_name}")
             return True
         except Exception as upload_e:
